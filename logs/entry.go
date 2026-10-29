@@ -20,8 +20,15 @@ type LogEntry struct {
 	Attributes  map[string]any `json:"attrs,omitempty"` // 其余附加字段（user_id、method、status 等），分组的字段用 "组.字段" 展平
 }
 
+// LogBatch 一批日志在网络上传输的格式：HTTP 接收接口的请求体、MQ 里的一条消息都是它，即 {"entries":[...]}。
+// 发送方和接收方共用这个结构，字段改动要两边一起改。
+type LogBatch struct {
+	Entries []LogEntry `json:"entries"`
+}
+
 // BatchSender 发送器：收集器攒好一批日志后交给它，由它决定送到哪里（进程内写库、MQ、HTTP）。
-// 同一时刻只会被一个协程调用；返回错误时这一批会被丢弃，需要重试的发送器自己在内部重试。
+// 收集器同一时刻只会用一个协程调用它；同一个发送器如果还被别处（比如接收接口）共用，就要自己保证并发安全。
+// 返回错误时这一批会被丢弃，需要重试的发送器自己在内部重试。
 type BatchSender interface {
 	SendBatch(ctx context.Context, entries []LogEntry) error
 }
