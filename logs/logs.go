@@ -17,12 +17,15 @@ import (
 // stdoutHandler Setup 传进来的原始输出（一般是打到 stdout 的 JSON handler），挂收集器时要在它旁边再并一路。
 var stdoutHandler slog.Handler
 
-// Setup 用 ContextHandler 包装 inner 并设为全局默认 logger。
+// Setup 用 ContextHandler 包装 inner 并设为全局默认 logger。一般直接用 Init，它会按默认格式创建 inner。
 // 之后直接调用 slog.InfoContext(ctx, ...) 也会带上 ctx 字段。
 // 全局只初始化一次：启动时由 main.go 调用。
 func Setup(inner slog.Handler) {
+	collectorMutex.Lock()
+	defer collectorMutex.Unlock()
 	stdoutHandler = inner
-	slog.SetDefault(slog.New(NewContextHandler(inner)))
+	// 已经挂了收集器的话保留它们，只换掉终端这一路
+	installDefaultLogger()
 }
 
 func CtxDebug(ctx context.Context, format string, args ...any) {

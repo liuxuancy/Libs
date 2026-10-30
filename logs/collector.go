@@ -31,13 +31,23 @@ type CollectorOptions struct {
 	QueueCapacity int           // 内存队列容量，满了直接丢弃，<=0 用默认 10000
 }
 
+// collectorPath 一路收集：批量缓冲加上往里放日志的 handler。
+// 主路（SetupCollector 挂的）和平台抄送（Init 打开的）各是一路，有各自的队列和协程，一路卡住不影响另一路。
+type collectorPath struct {
+	buffer  *entryBuffer
+	handler *collectorHandler
+}
+
 var (
-	collectorMutex  sync.Mutex
-	activeCollector *entryBuffer
+	collectorMutex sync.Mutex
+	// mainPath SetupCollector 挂的那一路，比如"先发 MQ、失败直接写库"；没挂时为 nil
+	mainPath *collectorPath
+	// platformPath Init 打开平台抄送时挂的那一路；没打开时为 nil
+	platformPath *collectorPath
 )
 
 // SetupCollector 挂上收集器：之后打的日志除了照常输出到 Setup 传入的 handler，达到 MinLevel 的还会攒批交给 Sender。
-// 必须在 Setup 之后调用；退出前调用 ShutdownCollector 把剩下的日志发完。
+// 必须在 Setup（或 Init）之后调用；退出前调用 Shutdown（或 ShutdownCollector）把剩下的日志发完。
 // 全局只初始化一次：启动时由 main.go 调用。
 func SetupCollector(options CollectorOptions) error {
 	collectorMutex.Lock()
@@ -48,7 +58,7 @@ func SetupCollector(options CollectorOptions) error {
 	if options.Sender == nil {
 		return errors.New("logs: 收集器的 Sender 不能为空")
 	}
-	if activeCollector != nil {
+	if mainPath != nil {
 		return errors.New("logs: 收集器已经挂过了，不能重复挂")
 	}
 	if options.BatchSize <= 0 {
@@ -60,33 +70,61 @@ func SetupCollector(options CollectorOptions) error {
 	if options.QueueCapacity <= 0 {
 		options.QueueCapacity = defaultQueueCapacity
 	}
-
-	buffer := newEntryBuffer(options.Sender, options.BatchSize, options.FlushInterval, options.QueueCapacity, os.Stderr)
-	buffer.start()
-	activeCollector = buffer
-	collector := &collectorHandler{
-		buffer:      buffer,
-		serviceName: options.ServiceName,
-		environment: options.Environment,
-		minLevel:    options.MinLevel,
-	}
-	slog.SetDefault(slog.New(NewContextHandler(newFanoutHandler(stdoutHandler, collector))))
+	mainPath = newCollectorPath(options)
+	installDefaultLogger()
 	return nil
 }
 
-// ShutdownCollector 摘掉收集器，并把队列里剩下的日志发完，最多等到 ctx 结束。没挂收集器时什么也不做。
+// ShutdownCollector 摘掉 SetupCollector 挂的那一路，并把队列里剩下的日志发完，最多等到 ctx 结束。没挂时什么也不做。
+// 平台抄送那一路不在这里收尾，用了 Init 的程序退出前调用 Shutdown，两路一起收尾。
 // 全局只调用一次：进程退出前由 main.go 调用。
 func ShutdownCollector(ctx context.Context) error {
 	collectorMutex.Lock()
 	defer collectorMutex.Unlock()
-	if activeCollector == nil {
+	return shutdownCollectorPath(ctx, &mainPath)
+}
+
+// newCollectorPath 创建一路收集并启动它的后台协程；options 要先补好默认值。
+func newCollectorPath(options CollectorOptions) *collectorPath {
+	buffer := newEntryBuffer(options.Sender, options.BatchSize, options.FlushInterval, options.QueueCapacity, os.Stderr)
+	buffer.start()
+	return &collectorPath{
+		buffer: buffer,
+		handler: &collectorHandler{
+			buffer:      buffer,
+			serviceName: options.ServiceName,
+			environment: options.Environment,
+			minLevel:    options.MinLevel,
+		},
+	}
+}
+
+// shutdownCollectorPath 摘掉一路收集并把它剩下的日志发完；path 指向 mainPath 或 platformPath。调用方要持有 collectorMutex。
+func shutdownCollectorPath(ctx context.Context, path **collectorPath) error {
+	if *path == nil {
 		return nil
 	}
-	// 先换回只打 stdout，后面再打的日志不再进队列
-	slog.SetDefault(slog.New(NewContextHandler(stdoutHandler)))
-	err := activeCollector.stop(ctx)
-	activeCollector = nil
-	return err
+	stoppingPath := *path
+	*path = nil
+	// 先把这一路从全局 logger 里摘掉，后面再打的日志不再进它的队列
+	installDefaultLogger()
+	return stoppingPath.buffer.stop(ctx)
+}
+
+// installDefaultLogger 按现在挂着的几路重建全局 logger：终端输出，再加上主路、平台抄送（挂了哪路加哪路）。
+// 调用方要持有 collectorMutex。
+func installDefaultLogger() {
+	handlers := []slog.Handler{stdoutHandler}
+	for _, path := range []*collectorPath{mainPath, platformPath} {
+		if path != nil {
+			handlers = append(handlers, path.handler)
+		}
+	}
+	if len(handlers) == 1 {
+		slog.SetDefault(slog.New(NewContextHandler(stdoutHandler)))
+		return
+	}
+	slog.SetDefault(slog.New(NewContextHandler(newFanoutHandler(handlers...))))
 }
 
 // collectorHandler 把日志转成 LogEntry 放进批量缓冲。实现 slog.Handler。
@@ -103,9 +141,15 @@ func (handler *collectorHandler) Enabled(_ context.Context, level slog.Level) bo
 	return level >= handler.minLevel
 }
 
-func (handler *collectorHandler) Handle(_ context.Context, record slog.Record) error {
+func (handler *collectorHandler) Handle(ctx context.Context, record slog.Record) error {
+	return handler.handleWithEntryID(ctx, record, newEntryID())
+}
+
+// handleWithEntryID 用指定的条目 ID 转成 LogEntry 放进队列。
+// 同一条日志同时进主路和平台抄送两路时，fanoutHandler 给两路传同一个 ID，接收方按 ID 去重时认得出是同一条。
+func (handler *collectorHandler) handleWithEntryID(_ context.Context, record slog.Record, entryID string) error {
 	entry := LogEntry{
-		EntryID:     newEntryID(),
+		EntryID:     entryID,
 		Time:        record.Time,
 		Level:       record.Level.String(),
 		ServiceName: handler.serviceName,
@@ -227,13 +271,24 @@ func (handler *fanoutHandler) Enabled(ctx context.Context, level slog.Level) boo
 }
 
 // Handle 每个下游各拿一份 Record 副本，一个下游出错不影响其他下游，最后返回第一个错误。
+// 收集器那几路共用同一个条目 ID：同一条日志进了主路和平台抄送，在两边都是同一个 ID。
 func (handler *fanoutHandler) Handle(ctx context.Context, record slog.Record) error {
 	var firstErr error
+	entryID := ""
 	for _, downstream := range handler.handlers {
 		if !downstream.Enabled(ctx, record.Level) {
 			continue
 		}
-		if err := downstream.Handle(ctx, record.Clone()); err != nil && firstErr == nil {
+		var err error
+		if collector, isCollector := downstream.(*collectorHandler); isCollector {
+			if entryID == "" {
+				entryID = newEntryID()
+			}
+			err = collector.handleWithEntryID(ctx, record.Clone(), entryID)
+		} else {
+			err = downstream.Handle(ctx, record.Clone())
+		}
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
